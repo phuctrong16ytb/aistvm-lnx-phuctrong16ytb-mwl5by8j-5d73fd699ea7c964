@@ -1,0 +1,229 @@
+
+# AISTVM: bounded Linux development/debug session, not persistent hosting.
+# GitHub-hosted jobs have a maximum lifetime of 360 minutes. No renew/re-dispatch loop.
+name: AISTVM Linux development session
+run-name: "AISTVM Linux | aistuser"
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: aistvm-linux-session
+  cancel-in-progress: false
+jobs:
+  linux-session:
+    name: Linux development/debug
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      AISTVM_USERNAME: "aistuser"
+      AISTVM_DURATION_MINUTES: "15"
+      AISTVM_WORKSPACE: "/home/runner/aistvm-workspace"
+    steps:
+      - name: Establish hard job deadline
+        run: |
+          set -euo pipefail
+          # Reserve one minute for cleanup before this job's own timeout.
+          deadline=$(date -u -d "+$((25 - 1)) minutes" +%Y-%m-%dT%H:%M:%SZ)
+          echo "AISTVM_JOB_DEADLINE=$deadline" >> "$GITHUB_ENV"
+          # The session budget is charged from the moment the run starts, so the
+          # minutes spent building the machine count towards the same duration
+          # the user selected.
+          session_deadline=$(date -u -d "+15 minutes" +%Y-%m-%dT%H:%M:%SZ)
+          echo "AISTVM_SESSION_DEADLINE=$session_deadline" >> "$GITHUB_ENV"
+
+      - name: Configure Linux session and start sshx
+        id: prepare
+        timeout-minutes: 8
+        env:
+          AISTVM_RDP_PASSWORD: ${{ secrets.AISTVM_RDP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Never print environment variables, secrets or keys.
+          stage='starting'
+          report_failure() {
+            # Surface which stage failed without echoing any secret.
+            echo "Linux setup failed at '$stage': $1"
+            echo 'Check the selected runner image and the sshx service status.'
+          }
+          trap 'report_failure "unexpected error"' ERR
+          username="$AISTVM_USERNAME"
+          if [[ ! "$username" =~ ^[a-z_][a-z0-9_-]{2,31}$ ]]; then
+            report_failure 'Invalid Linux username.'
+            exit 1
+          fi
+          password="$AISTVM_RDP_PASSWORD"
+          if [[ ${#password} -lt 12 || ${#password} -gt 127 ]]; then
+            report_failure 'Account password length is out of range.'
+            exit 1
+          fi
+          if [[ ! "$password" =~ [A-Z] || ! "$password" =~ [a-z] || ! "$password" =~ [0-9] || ! "$password" =~ [^A-Za-z0-9] ]]; then
+            report_failure 'Account password does not meet the security policy.'
+            exit 1
+          fi
+          if [[ "$password" == *"$username"* ]]; then
+            report_failure 'Account password must not contain the username.'
+            exit 1
+          fi
+          if id "$username" >/dev/null 2>&1; then
+            report_failure 'Refusing to modify an existing Linux user.'
+            exit 1
+          fi
+
+          stage='creating Linux user'
+          sudo useradd --create-home --shell /bin/bash "$username"
+          echo "$username:$password" | sudo chpasswd
+          echo "AISTVM_CREATED_USER=$username" >> "$GITHUB_ENV"
+          sudo mkdir -p "$AISTVM_WORKSPACE"
+          sudo chown "$username:$username" "$AISTVM_WORKSPACE"
+
+          stage='granting full sudo'
+          # The owner asked for full root inside the throwaway machine. Grant
+          # passwordless sudo explicitly; do not rely on the default sudo group
+          # membership, which may still prompt for the password.
+          echo "$username ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/aistvm-session >/dev/null
+          sudo chmod 0440 /etc/sudoers.d/aistvm-session
+          sudo visudo -cf /etc/sudoers.d/aistvm-session >/dev/null
+
+          stage='configuring shell prompt'
+          # Give the login shell a branded AISTVM prompt with real colour, an
+          # on-login banner and colour for ls/grep, so the sshx terminal looks
+          # like a normal console instead of a bare "$". The system bashrc is
+          # sourced FIRST because it sets its own PS1; ours is applied after so
+          # it wins. The workspace already belongs to the session user, so write
+          # the file through sudo tee instead of a plain redirect.
+          printf '%s\n'             '[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc'             'export HOME="/home/runner/aistvm-workspace"'             'export TERM="xterm-256color"'             'export COLORTERM="truecolor"'             'export CLICOLOR=1'             'export LS_COLORS="di=1;34:ln=1;36:so=1;35:pi=33:ex=1;32:bd=1;33:cd=1;33:su=1;31:sg=1;30:*.zip=1;31:*.tar=1;31:*.gz=1;31"'             'alias ls="ls --color=auto"'             'alias ll="ls -alF --color=auto"'             'alias la="ls -A --color=auto"'             'alias l="ls -CF --color=auto"'             'alias grep="grep --color=auto"'             'alias fgrep="fgrep --color=auto"'             'alias egrep="egrep --color=auto"'             'export PS1="\[\e[1;32m\]aistvm\[\e[0m\] \[\e[1;34m\]\w\[\e[0m\] \[\e[1;32m\]❯\[\e[0m\] "'             'export PROMPT_COMMAND=""'             'if [[ $- == *i* ]]; then'             '  printf "\n\033[1;32m  AISTVM\033[0m \033[2m·\033[0m \033[1;37mmáy Linux tạm thời\033[0m\n"'             '  printf "\033[2m  Terminal thật (PTY) chia sẻ qua sshx.io · gõ \033[0m\033[1;33mexit\033[0m\033[2m để thoát\033[0m\n\n"'             'fi'             | sudo tee "$AISTVM_WORKSPACE/.bash_profile" >/dev/null
+          sudo chown "$username:$username" "$AISTVM_WORKSPACE/.bash_profile"
+
+          stage='installing sshx'
+          # sshx shares a real PTY over the browser. It is a single static
+          # binary; the installer drops it in /usr/local/bin.
+          curl -fsSL https://sshx.io/get | sh
+          sshx_bin="/usr/local/bin/sshx"
+          if [[ ! -x "$sshx_bin" ]]; then
+            report_failure 'The sshx binary was not installed.'
+            exit 1
+          fi
+          echo "AISTVM_SSHX_BIN=$sshx_bin" >> "$GITHUB_ENV"
+
+          stage='starting sshx'
+          # Run sshx as the session user, inside the workspace, in quiet mode so
+          # stdout carries exactly one line: the shareable link. setsid detaches
+          # it into its own session so it survives the end of this step.
+          rm -f "$RUNNER_TEMP/sshx.out" "$RUNNER_TEMP/sshx.err"
+          sudo -u "$username" env HOME="$AISTVM_WORKSPACE" SHELL=/bin/bash TERM=xterm-256color \
+            setsid "$sshx_bin" --quiet --name "aistvm-$GITHUB_RUN_ID" \
+            >"$RUNNER_TEMP/sshx.out" 2>"$RUNNER_TEMP/sshx.err" </dev/null &
+
+          stage='reading sshx link'
+          link=''
+          for attempt in $(seq 1 60); do
+            link=$(grep -oE 'https://sshx\.io/s/[A-Za-z0-9]+#[A-Za-z0-9]+' "$RUNNER_TEMP/sshx.out" 2>/dev/null | head -n1 || true)
+            if [[ -n "$link" ]]; then break; fi
+            if [[ $attempt -eq 60 ]]; then
+              report_failure 'The sshx link was not produced in time.'
+              exit 1
+            fi
+            sleep 1
+          done
+          if [[ ! "$link" =~ ^https://sshx\.io/s/[A-Za-z0-9]+#[A-Za-z0-9]+$ ]]; then
+            report_failure 'The sshx link is malformed.'
+            exit 1
+          fi
+          echo "link=$link" >> "$GITHUB_OUTPUT"
+          ready_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "ready_at=$ready_at" >> "$GITHUB_OUTPUT"
+          unset password AISTVM_RDP_PASSWORD
+
+      - name: "Linux ready | ${{ steps.prepare.outputs.link }} | ${{ steps.prepare.outputs.ready_at }}"
+        id: readiness
+        env:
+          AISTVM_READY_AT: ${{ steps.prepare.outputs.ready_at }}
+          AISTVM_READY_LINK: ${{ steps.prepare.outputs.link }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$AISTVM_READY_LINK" ]]; then
+            echo 'The sshx link is missing.'
+            exit 1
+          fi
+          if [[ ! "$AISTVM_READY_LINK" =~ ^https://sshx\.io/s/[A-Za-z0-9]+#[A-Za-z0-9]+$ ]]; then
+            echo 'The sshx link is malformed.'
+            exit 1
+          fi
+          if [[ -n "${AISTVM_SSHX_BIN:-}" ]] && ! pgrep -f -- "$AISTVM_SSHX_BIN" >/dev/null; then
+            echo 'The sshx process is not running.'
+            exit 1
+          fi
+          ready_at=$(date -u -d "$AISTVM_READY_AT" +%s)
+          # Keep the session budget that started with the job (build time counts),
+          # but never let it outlive the job's own hard deadline.
+          session_deadline=$(date -u -d "$AISTVM_SESSION_DEADLINE" +%s)
+          job_deadline=$(date -u -d "$AISTVM_JOB_DEADLINE" +%s)
+          if [[ $job_deadline -lt $session_deadline ]]; then
+            deadline=$job_deadline
+          else
+            deadline=$session_deadline
+          fi
+          if [[ $deadline -le $(date -u +%s) ]]; then
+            echo 'Job deadline reached during setup.'
+            exit 1
+          fi
+          echo "AISTVM_SESSION_DEADLINE=$deadline" >> "$GITHUB_ENV"
+          echo "AISTVM_READY_EPOCH=$ready_at" >> "$GITHUB_ENV"
+          echo 'The sshx terminal link is live.'
+
+      - name: Remove all temporary workflow sources after startup
+        if: ${{ success() }}
+        env:
+          # AISTVM_WORKFLOW_CLEANUP_TOKEN should be a classic PAT with repo +
+          # workflow scopes, or a fine-grained token with Contents: write and
+          # Workflows: write. github.token is only a best-effort fallback.
+          AISTVM_GITHUB_TOKEN: ${{ secrets.AISTVM_WORKFLOW_CLEANUP_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          headers=(-H "Accept: application/vnd.github+json" -H "Authorization: Bearer $AISTVM_GITHUB_TOKEN" -H "X-GitHub-Api-Version: 2022-11-28")
+          base="https://api.github.com/repos/$GITHUB_REPOSITORY/contents"
+          ref=$(python3 -c 'import os,urllib.parse; print(urllib.parse.quote(os.environ["GITHUB_REF_NAME"]))')
+          workflow_files=$(curl -fsS "${headers[@]}" "$base/.github/workflows?ref=$ref" || echo '[]')
+          for entry in $(echo "$workflow_files" | python3 -c 'import json,sys
+          try:
+              items = json.load(sys.stdin)
+          except Exception:
+              items = []
+          for item in items:
+              if item.get("type") == "file" and item.get("sha"):
+                  print(item["url"] + "|" + item["sha"])'); do
+            file_url="${entry%%|*}"; sha="${entry##*|}"
+            body=$(python3 -c 'import json,sys; print(json.dumps({"message":"Remove temporary AISTVM workflow source after startup","sha":sys.argv[1],"branch":sys.argv[2]}))' "$sha" "$GITHUB_REF_NAME")
+            curl -fsS "${headers[@]}" -X DELETE -H 'Content-Type: application/json' -d "$body" "$file_url" >/dev/null || true
+          done
+          echo 'Temporary setup files removed after startup.'
+
+      - name: Bounded development/debug session
+        run: |
+          set -euo pipefail
+          deadline=$AISTVM_SESSION_DEADLINE
+          while [[ $(date -u +%s) -lt $deadline ]]; do
+            remaining=$((deadline - $(date -u +%s)))
+            echo "Development/debug heartbeat; $remaining seconds remain. No automatic renewal."
+            if [[ $remaining -lt 60 ]]; then sleep $((remaining > 0 ? remaining : 1)); else sleep 60; fi
+            if [[ -n "${AISTVM_SSHX_BIN:-}" ]] && ! pgrep -f -- "$AISTVM_SSHX_BIN" >/dev/null; then
+              echo 'The sshx process stopped.'
+              exit 1
+            fi
+          done
+
+      - name: Cleanup Linux session
+        if: ${{ always() }}
+        timeout-minutes: 2
+        run: |
+          set -uo pipefail
+          if [[ -n "${AISTVM_SSHX_BIN:-}" ]]; then
+            sudo pkill -f -- "$AISTVM_SSHX_BIN" 2>/dev/null || true
+          fi
+          if [[ -n "${AISTVM_CREATED_USER:-}" ]] && id "$AISTVM_CREATED_USER" >/dev/null 2>&1; then
+            sudo userdel -r "$AISTVM_CREATED_USER" 2>/dev/null || true
+          fi
+          echo 'The sshx process stopped and the temporary Linux account removed.'
+  
